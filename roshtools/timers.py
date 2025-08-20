@@ -1,76 +1,209 @@
 import time
 import math
+import gc
+from contextlib import contextmanager
 from functools import wraps
-from typing import Callable, Any
+from typing import Callable, Any, List, Tuple, Dict, Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class TimingInfo:
+    result: Any
+    seconds: float
+    complexity: Optional[str]  # None if complexity analysis was not performed
+    sizes: Optional[List[int]] = None
+    per_call_times: Optional[List[float]] = None
+    model_errors: Optional[Dict[str, float]] = None  # RMSE (s) per candidate
+
+    def as_tuple(self):
+        return self.result, self.seconds, self.complexity
 
 
 class timer:
-    def __init__(self, label: str = "Elapsed", analyze_complexity: bool = False, samples: int = 6):
+    """
+    Use as context manager:
+        with timer("Block"):
+            ...
+
+    Use as decorator (returns TimingInfo instead of raw result):
+        @timer("Work", analyze_complexity=True)
+        def f(data): ...
+        info = f(big_list)
+        print(info.seconds, info.complexity)
+    """
+
+    def __init__(
+        self,
+        label: str = "Elapsed",
+        analyze_complexity: bool = False,
+        samples: int = 7,
+        min_time: float = 0.05,   # target timing per size (s), adaptively loops to reach this
+        max_loops: int = 256,     # safety cap on inner repeats
+        print_result: bool = True # print timing/complexity to stdout
+    ):
         self.label = label
         self.analyze_complexity = analyze_complexity
-        self.samples = samples
+        self.samples = max(3, samples)
+        self.min_time = max(0.0, min_time)
+        self.max_loops = max(1, max_loops)
+        self.print_result = print_result
+        self.elapsed: Optional[float] = None  # available after context exit
 
-    # Context manager support
+    # ---------- Context manager ----------
     def __enter__(self):
-        self.start = time.time()
+        self._start = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        end = time.time()
-        print(f"{self.label}: {end - self.start:.4f} seconds")
+        end = time.perf_counter()
+        self.elapsed = end - self._start
+        if self.print_result:
+            print(f"{self.label}: {self.elapsed:.6f} seconds")
 
-    # Decorator support
+    # ---------- Decorator ----------
     def __call__(self, func: Callable) -> Callable:
         @wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            # Normal timing
-            start = time.time()
-            result = func(*args, **kwargs)
-            end = time.time()
-            elapsed = end - start
+        def wrapper(*args, **kwargs) -> Tuple:
+            # Single timing first (always)
+            start = time.perf_counter()
+            res = func(*args, **kwargs)
+            elapsed = time.perf_counter() - start
 
             if not self.analyze_complexity:
-                print(f"{self.label} ({func.__name__}): {elapsed:.4f} seconds")
-                return result
+                if self.print_result:
+                    print(f"{self.label} ({func.__name__}): {elapsed:.6f} seconds")
+                return res, elapsed, "O(1)"
 
-            # Complexity analysis (empirical)
-            times, sizes = [], []
-            for scale in range(1, self.samples + 1):
-                new_args = [arg[: len(arg) // self.samples * scale] if hasattr(arg, "__len__") else arg
-                            for arg in args]
+            # ---- Complexity analysis (empirical, no numpy/sklearn) ----
+            # We’ll vary the size of the FIRST sliceable/len()-able argument.
+            idx, base_len = self._find_sized_arg(args)
+            if idx is None or base_len < self.samples:
+                # Can't analyze; fall back to time only
+                if self.print_result:
+                    print(f"{self.label} ({func.__name__}): {elapsed:.6f} seconds, ~ (size unknown)")
+                return res, elapsed, "O(1)"
 
-                s = time.time()
-                func(*new_args, **kwargs)
-                e = time.time()
+            sizes = self._geometric_sizes(base_len, self.samples)
 
-                sizes.append(len(new_args[0]) if hasattr(new_args[0], "__len__") else scale)
-                times.append(e - s)
+            # Warm-up run (outside timing) to stabilize
+            try:
+                _ = func(*self._resize_args(args, idx, sizes[0]), **kwargs)
+            except Exception:
+                pass  # ignore failures during warmup; user function may rely on full size
 
-            # compute slope of log-log regression manually
-            log_sizes = [math.log(s + 1e-9) for s in sizes]
-            log_times = [math.log(t + 1e-9) for t in times]
+            per_call_times: List[float] = []
+            gc_was_enabled = gc.isenabled()
+            try:
+                gc.disable()
+                for n in sizes:
+                    # Adaptively repeat to reach min_time for better signal/noise
+                    loops = 1
+                    total = 0.0
+                    resized = self._resize_args(args, idx, n)
+                    while total < self.min_time and loops <= self.max_loops:
+                        t0 = time.perf_counter()
+                        for _ in range(loops):
+                            func(*resized, **kwargs)
+                        total = time.perf_counter() - t0
+                        if total < self.min_time:
+                            loops *= 2
+                    per_call = total / max(1, loops)
+                    per_call_times.append(per_call)
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
 
-            n = len(log_sizes)
-            mean_x = sum(log_sizes) / n
-            mean_y = sum(log_times) / n
+            # Fit against candidate models (with intercept)
+            candidates = {
+                "O(1)":              lambda x: 1.0,
+                "O(log n)":          lambda x: math.log(x),
+                "O(n)":              lambda x: float(x),
+                "O(n log n)":        lambda x: x * math.log(x),
+                "O(n^2)":            lambda x: x**2,
+                "O(n^3)":            lambda x: x**3,
+                "O(n^4)":            lambda x: x**4,
+                "O(n^5)":            lambda x: x**5,
+            }
 
-            numerator = sum((log_sizes[i] - mean_x) * (log_times[i] - mean_y) for i in range(n))
-            denominator = sum((log_sizes[i] - mean_x) ** 2 for i in range(n))
-            slope = numerator / denominator if denominator != 0 else 0
+            # Avoid log(0)
+            safe_sizes = [max(2, s) for s in sizes]
 
-            # Map slope to Big-O
-            if slope < 0.2:
-                complexity = "O(1)"
-            elif slope < 0.8:
-                complexity = "O(log n)"
-            elif slope < 1.3:
-                complexity = "O(n)"
-            elif slope < 1.8:
-                complexity = "O(n log n)"
-            else:
-                complexity = f"O(n^{slope:.2f})"
+            errors: Dict[str, float] = {}
+            for name, f in candidates.items():
+                xs = [f(s) for s in safe_sizes]
+                a, b = self._linreg(xs, per_call_times)  # y ≈ a + b*x
+                rmse = self._rmse(xs, per_call_times, a, b)
+                errors[name] = rmse
 
-            print(f"{self.label} ({func.__name__}): {elapsed:.4f} seconds, ~ {complexity}")
-            return result
+            # Choose best model by lowest RMSE
+            best_model = min(errors, key=errors.get)
+            if self.print_result:
+                print(f"{self.label} ({func.__name__}): {elapsed:.6f} seconds, ~ {best_model}")
 
+            return res, elapsed, best_model
         return wrapper
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _find_sized_arg(args: tuple):
+        for i, a in enumerate(args):
+            if hasattr(a, "__len__") and hasattr(a, "__getitem__"):
+                try:
+                    n = len(a)
+                    _ = a[:1]
+                    return i, n
+                except Exception:
+                    continue
+            # Support integer input for scaling tests
+            elif isinstance(a, int) and a > 0:
+                return i, a
+        return None, None
+
+    @staticmethod
+    def _geometric_sizes(max_n: int, samples: int) -> List[int]:
+        # geometric schedule from roughly max_n / 2^(samples-1) up to max_n
+        sizes = []
+        factor = (max_n / 2) ** (1 / (samples - 1))
+        val = max(2, int(max_n / 2))
+        for _ in range(samples - 1):
+            sizes.append(min(max_n, int(val)))
+            val *= factor
+        sizes.append(max_n)
+        # ensure strictly increasing
+        sizes = sorted(list(set(sizes)))
+        while len(sizes) < samples:
+            sizes.append(max_n)
+        return sizes
+
+    @staticmethod
+    def _resize_args(args: Tuple[Any, ...], idx: int, n: int) -> Tuple[Any, ...]:
+        args = list(args)
+        sized = args[idx]
+        try:
+            args[idx] = sized[:n] if hasattr(sized, "__getitem__") else sized
+        except Exception:
+            args[idx] = sized
+        return tuple(args)
+
+    @staticmethod
+    def _linreg(x: List[float], y: List[float]) -> Tuple[float, float]:
+        # simple linear regression with intercept: y ≈ a + b*x
+        n = len(x)
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+        num = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+        den = sum((x[i] - mean_x) ** 2 for i in range(n))
+        b = (num / den) if den != 0 else 0.0
+        a = mean_y - b * mean_x
+        return a, b
+
+    @staticmethod
+    def _rmse(x: List[float], y: List[float], a: float, b: float) -> float:
+        n = len(x)
+        se = 0.0
+        for i in range(n):
+            pred = a + b * x[i]
+            diff = y[i] - pred
+            se += diff * diff
+        return (se / n) ** 0.5
